@@ -558,7 +558,8 @@ class ChronosModel(AbstractTimeSeriesModel):
         with warning_filter(all_warnings=True):
             import torch
 
-            if self.model_pipeline is None or self.optimization_strategy is not None:
+            if self.model_pipeline is None:
+                # FIXME: optimization_strategy is ignored when model is fine-tuned
                 # load model pipeline to device memory
                 self.load_model_pipeline()
 
