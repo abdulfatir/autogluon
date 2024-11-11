@@ -336,7 +336,7 @@ class ChronosModel(AbstractTimeSeriesModel):
             logging_steps=100,
             save_strategy="steps" if init_args["eval_during_fine_tune"] else "no",
             save_steps=100 if init_args["eval_during_fine_tune"] else None,
-            eval_strategy="steps" if init_args["eval_during_fine_tune"] else "no",
+            evaluation_strategy="steps" if init_args["eval_during_fine_tune"] else "no",
             eval_steps=100 if init_args["eval_during_fine_tune"] else None,
             report_to="none",
             max_steps=init_args["fine_tune_steps"],
