@@ -193,8 +193,8 @@ class ChronosFineTuningDataset(IterableDataset):
         for entry in iterable:
             yield format_transform_fn(entry)
 
-    def shuffle(self, shuffle_buffer_size: int | None = None):
-        """Returns a (pseudo) shuffled versionof this iterable dataset.
+    def shuffle(self, shuffle_buffer_size: Optional[int] = None):
+        """Returns a (pseudo) shuffled version of this iterable dataset.
 
         Parameters
         ----------

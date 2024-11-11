@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
 
@@ -322,6 +323,7 @@ class ChronosModel(AbstractTimeSeriesModel):
         init_args.setdefault("eval_max_items", 100)
         init_args.setdefault("shuffle_buffer_size", 10_000)
 
+        eval_during_fine_tune = init_args["eval_during_fine_tune"]
         output_dir = Path(self.path) / "transformers_logs"
         trainer_kwargs = dict(
             output_dir=str(output_dir),
@@ -334,20 +336,20 @@ class ChronosModel(AbstractTimeSeriesModel):
             logging_dir=str(output_dir),
             logging_strategy="steps",
             logging_steps=100,
-            save_strategy="steps" if init_args["eval_during_fine_tune"] else "no",
-            save_steps=100 if init_args["eval_during_fine_tune"] else None,
-            evaluation_strategy="steps" if init_args["eval_during_fine_tune"] else "no",
-            eval_steps=100 if init_args["eval_during_fine_tune"] else None,
             report_to="none",
             max_steps=init_args["fine_tune_steps"],
             gradient_accumulation_steps=1,
             dataloader_num_workers=self.data_loader_num_workers,
             tf32=self._has_tf32(),
             save_only_model=True,
-            load_best_model_at_end=True if init_args["eval_during_fine_tune"] else False,
-            metric_for_best_model="eval_loss" if init_args["eval_during_fine_tune"] else None,
             prediction_loss_only=True,
             save_total_limit=1,
+            save_strategy="steps" if eval_during_fine_tune else "no",
+            save_steps=100 if eval_during_fine_tune else None,
+            evaluation_strategy="steps" if eval_during_fine_tune else "no",
+            eval_steps=100 if eval_during_fine_tune else None,
+            load_best_model_at_end=True if eval_during_fine_tune else False,
+            metric_for_best_model="eval_loss" if eval_during_fine_tune else None,
         )
         user_trainer_kwargs = init_args.get("trainer_kwargs", {})
         trainer_kwargs.update(user_trainer_kwargs)
@@ -374,19 +376,20 @@ class ChronosModel(AbstractTimeSeriesModel):
         verbosity = kwargs.get("verbosity", 2)
         for logger_name in logging.root.manager.loggerDict:
             if "transformers" in logger_name:
-                pl_logger = logging.getLogger(logger_name)
-                pl_logger.setLevel(logging.ERROR if verbosity <= 3 else logging.INFO)
+                transformers_logger = logging.getLogger(logger_name)
+                transformers_logger.setLevel(logging.ERROR if verbosity <= 3 else logging.INFO)
 
         self._check_fit_params()
 
         fine_tune_args = self._get_model_params()
         do_fine_tune = fine_tune_args["fine_tune"]
+
+        if do_fine_tune:
+            assert train_data is not None, "train_data cannot be None when fine_tune=True"
+
         eval_during_fine_tune = val_data is not None and fine_tune_args["eval_during_fine_tune"]
 
-        if time_limit is not None:
-            fine_tune_time_limit = time_limit // 2 if do_fine_tune else 0
-            self.time_limit = time_limit - fine_tune_time_limit  # inference time budget
-
+        start_time = time.monotonic()
         if do_fine_tune:
             context_length = self._get_context_length(train_data)
             # load model pipeline to device memory
@@ -413,6 +416,13 @@ class ChronosModel(AbstractTimeSeriesModel):
             trainer_kwargs["disable_tqdm"] = trainer_kwargs.get("disable_tqdm", (verbosity < 3))
             output_dir = Path(trainer_kwargs["output_dir"])
 
+            if not eval_during_fine_tune:
+                # turn of eval-related trainer args
+                trainer_kwargs["evaluation_strategy"] = "no"
+                trainer_kwargs["eval_steps"] = None
+                trainer_kwargs["load_best_model_at_end"] = False
+                trainer_kwargs["metric_for_best_model"] = None
+
             training_args = TrainingArguments(**trainer_kwargs, **extra_trainer_kwargs)
             tokenizer_train_dataset = ChronosFineTuningDataset(
                 target_df=train_data,
@@ -424,12 +434,13 @@ class ChronosModel(AbstractTimeSeriesModel):
                 tokenizer=getattr(self.model_pipeline, "tokenizer", None),
                 mode="training",
             ).shuffle(fine_tune_args["shuffle_buffer_size"])
-            callbacks = [EvaluateAndSaveFinalStepCallback()]
 
+            callbacks = []
             if time_limit is not None:
-                callbacks.append(TimeLimitCallback(time_limit=fine_tune_time_limit))
+                callbacks.append(TimeLimitCallback(time_limit=time_limit))
 
             if val_data is not None:
+                callbacks.append(EvaluateAndSaveFinalStepCallback())
                 # evaluate on a randomly-sampled subset
                 eval_max_items = (
                     min(val_data.num_items, fine_tune_args["eval_max_items"])
@@ -454,13 +465,13 @@ class ChronosModel(AbstractTimeSeriesModel):
                 model=self.model_pipeline.inner_model,
                 args=training_args,
                 train_dataset=tokenizer_train_dataset,
-                eval_dataset=tokenizer_val_dataset,
+                eval_dataset=tokenizer_val_dataset if val_data is not None else None,
                 callbacks=callbacks,
             )
 
             if verbosity < 3:
                 # remove PrinterCallback from callbacks which logs to the console via a print() call,
-                # so cannot be handled by setting the log level
+                # so it cannot be handled by setting the log level
                 trainer.pop_callback(PrinterCallback)
             else:
                 logger.warning(
@@ -478,15 +489,13 @@ class ChronosModel(AbstractTimeSeriesModel):
                 # get the best eval_loss logged during fine-tuning
                 log_history_df = pd.DataFrame(trainer.state.log_history)
                 best_train_eval_loss = log_history_df["eval_loss"].min()
-            else:
+            elif val_data is not None:
                 # evaluate at the end of fine-tuning
                 best_train_eval_loss = trainer.evaluate()["eval_loss"]
 
-            if best_train_eval_loss <= zero_shot_eval_loss:
+            if val_data is None or best_train_eval_loss <= zero_shot_eval_loss:
                 fine_tuned_ckpt_path = Path(self.path) / self.fine_tuned_ckpt_name
-                logger.info(
-                    f"Validation loss improved after fine-tuning. Saving fine-tuned model to {fine_tuned_ckpt_path}"
-                )
+                logger.info(f"Saving fine-tuned model to {fine_tuned_ckpt_path}")
                 self.model_pipeline.inner_model.save_pretrained(Path(self.path) / self.fine_tuned_ckpt_name)
             else:
                 logger.info("Validation loss worsened after fine-tuning. Reverting to the pretrained model.")
@@ -496,6 +505,9 @@ class ChronosModel(AbstractTimeSeriesModel):
             if not fine_tune_args["keep_transformers_logs"]:
                 logger.debug(f"Removing transformers_logs directory {output_dir}")
                 shutil.rmtree(output_dir)
+
+        if time_limit is not None:
+            self.time_limit = time_limit - (time.monotonic() - start_time)  # inference time budget
 
     def _get_inference_data_loader(
         self,
