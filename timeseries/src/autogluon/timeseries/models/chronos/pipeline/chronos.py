@@ -364,11 +364,9 @@ class ChronosPipeline(BaseChronosPipeline):
     forecast_type: ForecastType = ForecastType.SAMPLES
 
     def __init__(self, tokenizer, model):
+        super().__init__(inner_model=model.model)
         self.tokenizer = tokenizer
         self.model = model
-
-        # for easy access to the inner HF-style model
-        self.inner_model = model.model
 
     @torch.no_grad()
     def embed(self, context: Union[torch.Tensor, List[torch.Tensor]]) -> Tuple[torch.Tensor, Any]:

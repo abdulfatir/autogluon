@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from transformers import PreTrainedModel
 
 from .utils import left_pad_and_stack_1D
 
@@ -35,6 +36,16 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
         "float32": torch.float32,
         "float64": torch.float64,
     }
+
+    def __init__(self, inner_model: PreTrainedModel):
+        """
+        Parameters
+        ----------
+        inner_model : PreTrainedModel
+            A hugging-face transformers PreTrainedModel, e.g., T5ForConditionalGeneration
+        """
+        # for easy access to the inner HF-style model
+        self.inner_model = inner_model
 
     def _prepare_and_validate_context(self, context: Union[torch.Tensor, List[torch.Tensor]]):
         if isinstance(context, list):

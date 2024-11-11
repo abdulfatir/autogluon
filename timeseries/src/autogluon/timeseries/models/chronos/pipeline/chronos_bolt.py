@@ -379,10 +379,8 @@ class ChronosBoltPipeline(BaseChronosPipeline):
     _aliases = ["PatchedT5Pipeline"]
 
     def __init__(self, model: ChronosBoltModelForForecasting):
+        super().__init__(inner_model=model)
         self.model = model
-
-        # for easy access to the inner HF-style model
-        self.inner_model = model
 
     @property
     def quantiles(self) -> List[float]:
