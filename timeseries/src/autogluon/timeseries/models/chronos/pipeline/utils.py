@@ -1,14 +1,170 @@
+import logging
 import os
 import re
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Iterable, Iterator, List, Literal, Optional
 
 import numpy as np
 import torch
+from gluonts.dataset.field_names import FieldName
+from gluonts.transform import ExpectedNumInstanceSampler, InstanceSplitter, ValidationSplitSampler
+from torch.utils.data import IterableDataset
+from transformers import TrainerCallback
 
 from autogluon.core.utils.exceptions import TimeLimitExceeded
 from autogluon.timeseries.dataset.ts_dataframe import TimeSeriesDataFrame
+from autogluon.timeseries.models.chronos.pipeline import ChronosTokenizer
+from autogluon.timeseries.models.gluonts.abstract_gluonts import SimpleGluonTSDataset
+
+logger = logging.getLogger("autogluon.timeseries.models.chronos")
+
+
+class PseudoShuffledIterableDataset(IterableDataset):
+    """
+    Shuffle entries from an iterable by temporarily accumulating them
+    in an intermediate buffer.
+
+    Parameters
+    ----------
+    base_dataset
+        The original iterable object, representing the dataset.
+    shuffle_buffer_length
+        Size of the buffer use to shuffle entries from the base dataset.
+    """
+
+    def __init__(self, base_dataset, shuffle_buffer_length: int = 100) -> None:
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.shuffle_buffer_length = shuffle_buffer_length
+        self.generator = torch.Generator()
+
+    def __iter__(self):
+        shuffle_buffer = []
+
+        for element in self.base_dataset:
+            shuffle_buffer.append(element)
+            if len(shuffle_buffer) >= self.shuffle_buffer_length:
+                idx = torch.randint(len(shuffle_buffer), size=(), generator=self.generator)
+                yield shuffle_buffer.pop(idx)
+
+        while shuffle_buffer:
+            idx = torch.randint(len(shuffle_buffer), size=(), generator=self.generator)
+            yield shuffle_buffer.pop(idx)
+
+
+class ChronosFineTuningDataset(IterableDataset):
+    """
+    Dataset wrapper, using a ``ChronosTokenizer`` to turn data from a time series
+    into a HuggingFace-compatible set of ``input_ids``, ``attention_mask`` and
+    ``labels``.
+
+    Entries from the original datasets are assumed to have a ``"start"`` attribute
+    (of type ``pd.Period``), and a ``"target"`` attribute (of type ``np.ndarray``).
+
+    Parameters
+    ----------
+    datasets
+        Datasets containing the original time series data.
+    probabilities
+        In training mode, data will be sampled from each of the original datasets
+        with these probabilities.
+    tokenizer
+        Tokenizer to be used to turn sequences of real numbers into token IDs.
+    context_length
+        Samples context will be limited to this length.
+    prediction_length
+        Samples labels will be limited to this length.
+    drop_prob
+        In training mode, observations from a sample will be turned into ``np.nan``,
+        i.e. turned into missing values, with this probability.
+    min_past
+        Data samples will be considered only if there's at least ``min_past``-many
+        historical observations.
+    min_future
+        Data samples will be considered only if there's at least ``min_future``-many
+        future observations.
+    mode
+        One of ``"training"``, ``"validation"``, or ``"test"``.
+    np_dtype
+        Numpy float data type.
+    """
+
+    def __init__(
+        self,
+        tokenizer: ChronosTokenizer,
+        target_df: TimeSeriesDataFrame,
+        target_column: str = "target",
+        context_length: int = 512,
+        prediction_length: int = 64,
+        mode: Literal["training", "validation"] = "training",
+    ) -> None:
+        super().__init__()
+
+        assert mode in ("training", "validation")
+
+        # A dummy hourly freq is used because the model doesn't actually need the freq
+        self.gluonts_dataset = SimpleGluonTSDataset(target_df=target_df, freq="h", target_column=target_column)
+        self.tokenizer = tokenizer
+        self.context_length = context_length
+        self.prediction_length = prediction_length
+        self.mode = mode
+
+    def _create_instance_splitter(self, mode: str):
+        instance_sampler = {
+            "training": ExpectedNumInstanceSampler(num_instances=1.0, min_future=self.prediction_length),
+            "validation": ValidationSplitSampler(min_future=self.prediction_length),
+        }[mode]
+
+        return InstanceSplitter(
+            target_field=FieldName.TARGET,
+            is_pad_field=FieldName.IS_PAD,
+            start_field=FieldName.START,
+            forecast_start_field=FieldName.FORECAST_START,
+            instance_sampler=instance_sampler,
+            past_length=self.context_length,
+            future_length=self.prediction_length,
+            dummy_value=np.nan,
+        )
+
+    def _infinite_iterable(self, data: Iterable[dict]):
+        while True:
+            yield from data
+
+    def _create_training_data(self, data: Iterable[dict]):
+        data = self._infinite_iterable(data)
+        split_transform = self._create_instance_splitter("training")
+        data = split_transform.apply(data, is_train=True)
+        return data
+
+    def _create_validation_data(self, data: Iterable[dict]):
+        data = self._create_instance_splitter("validation").apply(data, is_train=False)
+        return data
+
+    def to_hf_format(self, entry: dict) -> dict:
+        past_target = torch.tensor(entry[f"past_{FieldName.TARGET}"]).unsqueeze(0)
+        input_ids, attention_mask, scale = self.tokenizer.context_input_transform(past_target)
+        future_target = torch.tensor(entry[f"future_{FieldName.TARGET}"]).unsqueeze(0)
+        labels, labels_mask = self.tokenizer.label_input_transform(future_target, scale)
+        labels[labels_mask == 0] = -100
+
+        return {
+            "input_ids": input_ids.squeeze(0),
+            "attention_mask": attention_mask.squeeze(0),
+            "labels": labels.squeeze(0),
+        }
+
+    def __iter__(self) -> Iterator:
+        if self.mode == "training":
+            iterable = self._create_training_data(self.gluonts_dataset)
+        elif self.mode == "validation":
+            iterable = self._create_validation_data(self.gluonts_dataset)
+
+        for entry in iterable:
+            yield self.to_hf_format(entry)
+
+    def shuffle(self, shuffle_buffer_length: int = 100):
+        return PseudoShuffledIterableDataset(self, shuffle_buffer_length)
 
 
 def left_pad_and_stack_1D(tensors: List[torch.Tensor]) -> torch.Tensor:
@@ -96,12 +252,47 @@ class ChronosInferenceDataLoader(torch.utils.data.DataLoader):
             self.callback()
 
 
+class EvaluateAndSaveFinalStepCallback(TrainerCallback):
+    """Callback evaluate and save the model at last training step."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= state.max_steps:
+            control.should_log = True
+            control.should_evaluate = True
+            control.should_save = True
+
+
+class TimeLimitCallback(TrainerCallback):
+    def __init__(self, time_limit: int):
+        """
+        Callback to stop training once a specified time has elapsed.
+
+        Parameters
+        ----------
+        time_limit: int
+            maximum time allowed for training in seconds.
+        """
+        self.time_limit = time_limit
+        self.start_time = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.monotonic()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        elapsed_time = time.monotonic() - self.start_time
+        if elapsed_time >= self.time_limit:
+            logger.warning(
+                f"The allocated training time limit of {self.time_limit:.1f}s exceeded. Interrupting training."
+            )
+            control.should_training_stop = True
+
+
 def timeout_callback(seconds: Optional[float]) -> Callable:
     """Return a callback object that raises an exception if time limit is exceeded."""
-    start_time = time.time()
+    start_time = time.monotonic()
 
     def callback() -> None:
-        if seconds is not None and time.time() - start_time > seconds:
+        if seconds is not None and time.monotonic() - start_time > seconds:
             raise TimeLimitExceeded
 
     return callback
