@@ -2,12 +2,14 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
-from transformers import PreTrainedModel
 
 from .utils import left_pad_and_stack_1D
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
 
 
 class ForecastType(Enum):
@@ -37,7 +39,7 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
         "float64": torch.float64,
     }
 
-    def __init__(self, inner_model: PreTrainedModel):
+    def __init__(self, inner_model: "PreTrainedModel"):
         """
         Parameters
         ----------
