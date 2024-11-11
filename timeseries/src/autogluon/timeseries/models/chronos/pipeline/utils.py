@@ -3,7 +3,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, List, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Literal, Optional
 
 import numpy as np
 import torch
@@ -14,8 +14,11 @@ from transformers import TrainerCallback
 
 from autogluon.core.utils.exceptions import TimeLimitExceeded
 from autogluon.timeseries.dataset.ts_dataframe import TimeSeriesDataFrame
-from autogluon.timeseries.models.chronos.pipeline import ChronosTokenizer
 from autogluon.timeseries.models.gluonts.abstract_gluonts import SimpleGluonTSDataset
+
+if TYPE_CHECKING:
+    from autogluon.timeseries.models.chronos.pipeline.chronos import ChronosTokenizer
+
 
 logger = logging.getLogger("autogluon.timeseries.models.chronos")
 
@@ -29,14 +32,14 @@ class PseudoShuffledIterableDataset(IterableDataset):
     ----------
     base_dataset
         The original iterable object, representing the dataset.
-    shuffle_buffer_length
+    shuffle_buffer_size
         Size of the buffer use to shuffle entries from the base dataset.
     """
 
-    def __init__(self, base_dataset, shuffle_buffer_length: int = 100) -> None:
+    def __init__(self, base_dataset, shuffle_buffer_size: int = 100) -> None:
         super().__init__()
         self.base_dataset = base_dataset
-        self.shuffle_buffer_length = shuffle_buffer_length
+        self.shuffle_buffer_size = shuffle_buffer_size
         self.generator = torch.Generator()
 
     def __iter__(self):
@@ -44,7 +47,7 @@ class PseudoShuffledIterableDataset(IterableDataset):
 
         for element in self.base_dataset:
             shuffle_buffer.append(element)
-            if len(shuffle_buffer) >= self.shuffle_buffer_length:
+            if len(shuffle_buffer) >= self.shuffle_buffer_size:
                 idx = torch.randint(len(shuffle_buffer), size=(), generator=self.generator)
                 yield shuffle_buffer.pop(idx)
 
@@ -55,48 +58,41 @@ class PseudoShuffledIterableDataset(IterableDataset):
 
 class ChronosFineTuningDataset(IterableDataset):
     """
-    Dataset wrapper, using a ``ChronosTokenizer`` to turn data from a time series
-    into a HuggingFace-compatible set of ``input_ids``, ``attention_mask`` and
-    ``labels``.
+    Dataset wrapper to convert a ``TimeSeriesDataFrame`` into an iterable dataset
+    compatible with Chronos models.
 
-    Entries from the original datasets are assumed to have a ``"start"`` attribute
-    (of type ``pd.Period``), and a ``"target"`` attribute (of type ``np.ndarray``).
+    When a ``tokenizer`` is provided, data is converted into HuggingFace-compatible set of
+    ``input_ids``, ``attention_mask`` and ``labels``, used by the original Chronos models.
+
+    When the ``tokenizer`` is omitted, data is converted into the format compatible with
+    ChronosBolt models, i.e., ``context`` and ``target``.
 
     Parameters
     ----------
-    datasets
-        Datasets containing the original time series data.
-    probabilities
-        In training mode, data will be sampled from each of the original datasets
-        with these probabilities.
-    tokenizer
-        Tokenizer to be used to turn sequences of real numbers into token IDs.
-    context_length
-        Samples context will be limited to this length.
-    prediction_length
-        Samples labels will be limited to this length.
-    drop_prob
-        In training mode, observations from a sample will be turned into ``np.nan``,
-        i.e. turned into missing values, with this probability.
-    min_past
-        Data samples will be considered only if there's at least ``min_past``-many
-        historical observations.
-    min_future
-        Data samples will be considered only if there's at least ``min_future``-many
-        future observations.
-    mode
-        One of ``"training"``, ``"validation"``, or ``"test"``.
-    np_dtype
-        Numpy float data type.
+    target_df : TimeSeriesDataFrame
+        The ``TimeSeriesDataFrame`` to be converted
+    target_column : str, default = "target"
+        The name of the column which contains the target time series, by default "target"
+    context_length : int, default = 512
+        The length of the historical context
+    prediction_length : int, default = 64
+        The prediction_length, i.e., length of label or target
+    tokenizer : ``ChronosTokenizer``, default = None
+        When a ``ChronosTokenizer`` object is provided, data will be converted into the
+        HuggingFace format accepted by the original Chronos models using this ``ChronosTokenizer``.
+        If None, data will be converted into the format accepted by ChronosBolt models.
+    mode : Literal["training", "validation"], default = "training"
+        When ``training``, random slices from the time series will be returned for training purposes.
+        If ``validation``, the last slice of each time series returned in the original order.
     """
 
     def __init__(
         self,
-        tokenizer: ChronosTokenizer,
         target_df: TimeSeriesDataFrame,
         target_column: str = "target",
         context_length: int = 512,
         prediction_length: int = 64,
+        tokenizer: Optional["ChronosTokenizer"] = None,
         mode: Literal["training", "validation"] = "training",
     ) -> None:
         super().__init__()
@@ -141,7 +137,21 @@ class ChronosFineTuningDataset(IterableDataset):
         data = self._create_instance_splitter("validation").apply(data, is_train=False)
         return data
 
-    def to_hf_format(self, entry: dict) -> dict:
+    def to_chronos_format(self, entry: dict) -> dict:
+        """Converts an entry from GluonTS data format with past and future targets
+        to the HuggingFace format accepted by the original Chronos models using the ChronosTokenizer.
+
+        Parameters
+        ----------
+        entry : dict
+            time series data entry in GluonTS format with ``past_target`` and ``future_target`` keys
+
+        Returns
+        -------
+        dict
+            time series data entry in HuggingFace format with ``input_ids``, ``attention_mask``, and ``labels``
+        """
+        assert self.tokenizer is not None, "A ChronosTokenizer is required to convert data into the Chronos format"
         past_target = torch.tensor(entry[f"past_{FieldName.TARGET}"]).unsqueeze(0)
         input_ids, attention_mask, scale = self.tokenizer.context_input_transform(past_target)
         future_target = torch.tensor(entry[f"future_{FieldName.TARGET}"]).unsqueeze(0)
@@ -154,17 +164,47 @@ class ChronosFineTuningDataset(IterableDataset):
             "labels": labels.squeeze(0),
         }
 
+    def to_chronos_bolt_format(self, entry: dict) -> dict:
+        """Converts an entry from GluonTS data format with past and future targets
+        to the format accepted by the ChronosBolt models.
+
+        Parameters
+        ----------
+        entry : dict
+            time series data entry in GluonTS format with ``past_target`` and ``future_target`` keys
+
+        Returns
+        -------
+        dict
+            time series data entry in ChronosBolt format with ``context`` and ``target``
+        """
+        past_target = torch.tensor(entry[f"past_{FieldName.TARGET}"])
+        future_target = torch.tensor(entry[f"future_{FieldName.TARGET}"])
+
+        return {"context": past_target, "target": future_target}
+
     def __iter__(self) -> Iterator:
         if self.mode == "training":
             iterable = self._create_training_data(self.gluonts_dataset)
         elif self.mode == "validation":
             iterable = self._create_validation_data(self.gluonts_dataset)
 
+        format_transform_fn = self.to_chronos_format if self.tokenizer is not None else self.to_chronos_bolt_format
         for entry in iterable:
-            yield self.to_hf_format(entry)
+            yield format_transform_fn(entry)
 
-    def shuffle(self, shuffle_buffer_length: int = 100):
-        return PseudoShuffledIterableDataset(self, shuffle_buffer_length)
+    def shuffle(self, shuffle_buffer_size: int | None = None):
+        """Returns a (pseudo) shuffled versionof this iterable dataset.
+
+        Parameters
+        ----------
+        shuffle_buffer_size : int | None, optional
+            The shuffle buffer size used for pseudo shuffling, by default None
+        """
+        assert shuffle_buffer_size is None or shuffle_buffer_size >= 0
+        if not shuffle_buffer_size:
+            return self
+        return PseudoShuffledIterableDataset(self, shuffle_buffer_size)
 
 
 def left_pad_and_stack_1D(tensors: List[torch.Tensor]) -> torch.Tensor:

@@ -367,6 +367,9 @@ class ChronosPipeline(BaseChronosPipeline):
         self.tokenizer = tokenizer
         self.model = model
 
+        # for easy access to the inner HF-style model
+        self.inner_model = model.model
+
     @torch.no_grad()
     def embed(self, context: Union[torch.Tensor, List[torch.Tensor]]) -> Tuple[torch.Tensor, Any]:
         """
@@ -510,7 +513,7 @@ class ChronosPipeline(BaseChronosPipeline):
             prediction_samples,
             q=torch.tensor(quantile_levels, dtype=prediction_samples.dtype),
             dim=-1,
-        )
+        ).permute(1, 2, 0)
 
         return quantiles, mean
 

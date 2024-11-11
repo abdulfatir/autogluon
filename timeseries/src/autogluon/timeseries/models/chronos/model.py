@@ -121,14 +121,17 @@ class ChronosModel(AbstractTimeSeriesModel):
     eval_during_fine_tune : bool, default = False
         If True, validation will be performed during fine-tuning to select the best checkpoint.
         Setting this argument to True may result in slower fine-tuning.
+    shuffle_buffer_size : int, default = 10000
+        The size of the shuffle buffer to shuffle the data during fine-tuning. If None, shuffling will
+        be turned off.
     eval_max_items : int, default = 100
         The maximum number of randomly-sampled time series to use from the validation set for evaluation
         during fine-tuning. If None, the entire validation dataset will be used.
     trainer_kwargs : dict, optional
         Extra keyword arguments passed to ``transformers.TrainingArguments``
     device : str, default = None
-        Device to use for inference. If None, model will use the GPU if available. For larger model sizes
-        `small`, `base`, and `large`; inference will fail if no GPU is available.
+        Device to use for inference (and fine-tuning, if enabled). If None, model will use the GPU if available.
+        For larger model sizes `small`, `base`, and `large`; inference will fail if no GPU is available.
     context_length : int or None, default = None
         The context length to use in the model. Shorter context lengths will decrease model accuracy, but result
         in faster inference. If None, the model will infer context length from the data set length at inference
@@ -273,7 +276,6 @@ class ChronosModel(AbstractTimeSeriesModel):
             minimum_resources["num_gpus"] = self.min_num_gpus
         return minimum_resources
 
-
     def load_model_pipeline(self, is_training: bool = False):
         from .pipeline import BaseChronosPipeline
 
@@ -291,6 +293,7 @@ class ChronosModel(AbstractTimeSeriesModel):
         pipeline = BaseChronosPipeline.from_pretrained(
             self.model_path,
             device_map=device,
+            # optimization cannot be used during fine-tuning
             optimization_strategy=None if is_training else self.optimization_strategy,
             torch_dtype=self.torch_dtype,
         )
@@ -317,6 +320,7 @@ class ChronosModel(AbstractTimeSeriesModel):
         init_args.setdefault("fine_tune_batch_size", self.default_batch_size)
         init_args.setdefault("eval_during_fine_tune", False)
         init_args.setdefault("eval_max_items", 100)
+        init_args.setdefault("shuffle_buffer_size", 10_000)
 
         output_dir = Path(self.path) / "transformers_logs"
         trainer_kwargs = dict(
@@ -361,6 +365,7 @@ class ChronosModel(AbstractTimeSeriesModel):
     ) -> None:
         from transformers.trainer import PrinterCallback, Trainer, TrainingArguments
 
+        from .pipeline import ChronosBoltPipeline
         from .pipeline.utils import ChronosFineTuningDataset, EvaluateAndSaveFinalStepCallback, TimeLimitCallback
 
         # verbosity < 3: all logs and warnings from transformers will be suppressed
@@ -385,21 +390,40 @@ class ChronosModel(AbstractTimeSeriesModel):
         if do_fine_tune:
             context_length = self._get_context_length(train_data)
             # load model pipeline to device memory
-            self.load_model_pipeline(context_length=context_length, is_training=True)
+            self.load_model_pipeline(is_training=True)
+
+            extra_trainer_kwargs = {}
+            fine_tune_prediction_length = self.prediction_length
+            if isinstance(self.model_pipeline, ChronosBoltPipeline):
+                # custom label_names is needed for validation to work with ChronosBolt models
+                extra_trainer_kwargs = dict(label_names=["target"])
+
+                # truncate prediction_length if it goes beyond ChronosBolt's prediction_length
+                fine_tune_prediction_length = min(
+                    self.model_pipeline.inner_model.config.chronos_config["prediction_length"], self.prediction_length
+                )
+
+                if self.prediction_length != fine_tune_prediction_length:
+                    logger.debug(
+                        f"ChronosBolt models can only be fine-tuned with a maximum prediction_length of {fine_tune_prediction_length}. "
+                        f"Setting prediction_length to {fine_tune_prediction_length}."
+                    )
 
             trainer_kwargs = fine_tune_args["trainer_kwargs"]
             trainer_kwargs["disable_tqdm"] = trainer_kwargs.get("disable_tqdm", (verbosity < 3))
             output_dir = Path(trainer_kwargs["output_dir"])
 
-            training_args = TrainingArguments(**trainer_kwargs)
+            training_args = TrainingArguments(**trainer_kwargs, **extra_trainer_kwargs)
             tokenizer_train_dataset = ChronosFineTuningDataset(
-                tokenizer=self.model_pipeline.tokenizer,
                 target_df=train_data,
                 target_column=self.target,
                 context_length=context_length,
-                prediction_length=self.prediction_length,
+                prediction_length=fine_tune_prediction_length,
+                # if tokenizer exists, then the data is returned in the HF-style format accepted by
+                # the original Chronos models otherwise the data is returned in ChronosBolt's format
+                tokenizer=getattr(self.model_pipeline, "tokenizer", None),
                 mode="training",
-            )
+            ).shuffle(fine_tune_args["shuffle_buffer_size"])
             callbacks = [TimeLimitCallback(time_limit=fine_tune_time_limit), EvaluateAndSaveFinalStepCallback()]
 
             if val_data is not None:
@@ -415,16 +439,16 @@ class ChronosModel(AbstractTimeSeriesModel):
                     val_data = val_data.loc[eval_items]
 
                 tokenizer_val_dataset = ChronosFineTuningDataset(
-                    tokenizer=self.model_pipeline.tokenizer,
                     target_df=val_data,
                     target_column=self.target,
                     context_length=context_length,
-                    prediction_length=self.prediction_length,
+                    prediction_length=fine_tune_prediction_length,
+                    tokenizer=getattr(self.model_pipeline, "tokenizer", None),
                     mode="validation",
                 )
 
             trainer = Trainer(
-                model=self.model_pipeline.model.model,
+                model=self.model_pipeline.inner_model,
                 args=training_args,
                 train_dataset=tokenizer_train_dataset,
                 eval_dataset=tokenizer_val_dataset,
@@ -460,11 +484,11 @@ class ChronosModel(AbstractTimeSeriesModel):
                 logger.info(
                     f"Validation loss improved after fine-tuning. Saving fine-tuned model to {fine_tuned_ckpt_path}"
                 )
-                self.model_pipeline.model.model.save_pretrained(Path(self.path) / self.fine_tuned_ckpt_name)
+                self.model_pipeline.inner_model.save_pretrained(Path(self.path) / self.fine_tuned_ckpt_name)
             else:
                 logger.info("Validation loss worsened after fine-tuning. Reverting to the pretrained model.")
                 self.model_pipeline = None
-                self.load_model_pipeline(context_length=context_length, is_training=False)
+                self.load_model_pipeline(is_training=False)
 
             if not fine_tune_args["keep_transformers_logs"]:
                 logger.debug(f"Removing transformers_logs directory {output_dir}")
