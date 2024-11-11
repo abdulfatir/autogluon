@@ -368,7 +368,12 @@ class ChronosModel(AbstractTimeSeriesModel):
         from transformers.trainer import PrinterCallback, Trainer, TrainingArguments
 
         from .pipeline import ChronosBoltPipeline
-        from .pipeline.utils import ChronosFineTuningDataset, EvaluateAndSaveFinalStepCallback, TimeLimitCallback
+        from .pipeline.utils import (
+            ChronosFineTuningDataset,
+            EvaluateAndSaveFinalStepCallback,
+            TimeLimitCallback,
+            LoggerCallback,
+        )
 
         # verbosity < 3: all logs and warnings from transformers will be suppressed
         # verbosity >= 3: progress bar and loss logs will be logged
@@ -449,7 +454,9 @@ class ChronosModel(AbstractTimeSeriesModel):
                 )
 
                 if fine_tune_eval_max_items < val_data.num_items:
-                    eval_items = np.random.choice(val_data.item_ids.values, size=fine_tune_eval_max_items, replace=False)
+                    eval_items = np.random.choice(
+                        val_data.item_ids.values, size=fine_tune_eval_max_items, replace=False
+                    )
                     val_data = val_data.loc[eval_items]
 
                 tokenizer_val_dataset = ChronosFineTuningDataset(
@@ -469,15 +476,16 @@ class ChronosModel(AbstractTimeSeriesModel):
                 callbacks=callbacks,
             )
 
-            if verbosity < 3:
-                # remove PrinterCallback from callbacks which logs to the console via a print() call,
-                # so it cannot be handled by setting the log level
-                trainer.pop_callback(PrinterCallback)
-            else:
+            # remove PrinterCallback from callbacks which logs to the console via a print() call,
+            # so it cannot be handled by setting the log level
+            trainer.pop_callback(PrinterCallback)
+
+            if verbosity >= 3:
                 logger.warning(
                     "Transformers logging is turned on during fine-tuning. Note that losses reported by transformers "
                     "may not correspond to those specified via `eval_metric`."
                 )
+                trainer.add_callback(LoggerCallback())
 
             if val_data is not None:
                 # evaluate once before training

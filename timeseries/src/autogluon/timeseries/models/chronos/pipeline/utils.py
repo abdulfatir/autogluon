@@ -328,6 +328,13 @@ class TimeLimitCallback(TrainerCallback):
             control.should_training_stop = True
 
 
+class LoggerCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        logs.pop("total_flos", None)
+        if state.is_local_process_zero:
+            logger.info(logs)
+
+
 def timeout_callback(seconds: Optional[float]) -> Callable:
     """Return a callback object that raises an exception if time limit is exceeded."""
     start_time = time.monotonic()
