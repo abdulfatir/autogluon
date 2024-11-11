@@ -424,7 +424,10 @@ class ChronosModel(AbstractTimeSeriesModel):
                 tokenizer=getattr(self.model_pipeline, "tokenizer", None),
                 mode="training",
             ).shuffle(fine_tune_args["shuffle_buffer_size"])
-            callbacks = [TimeLimitCallback(time_limit=fine_tune_time_limit), EvaluateAndSaveFinalStepCallback()]
+            callbacks = [EvaluateAndSaveFinalStepCallback()]
+
+            if time_limit is not None:
+                callbacks.append(TimeLimitCallback(time_limit=fine_tune_time_limit))
 
             if val_data is not None:
                 # evaluate on a randomly-sampled subset
