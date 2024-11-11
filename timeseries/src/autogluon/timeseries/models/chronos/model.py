@@ -119,16 +119,16 @@ class ChronosModel(AbstractTimeSeriesModel):
         The number of gradient update steps to fine-tune for
     fine_tune_batch_size : int, default = 16
         The batch size to use for fine-tuning
+    fine_tune_shuffle_buffer_size : int, default = 10000
+        The size of the shuffle buffer to shuffle the data during fine-tuning. If None, shuffling will
+        be turned off.
     eval_during_fine_tune : bool, default = False
         If True, validation will be performed during fine-tuning to select the best checkpoint.
         Setting this argument to True may result in slower fine-tuning.
-    shuffle_buffer_size : int, default = 10000
-        The size of the shuffle buffer to shuffle the data during fine-tuning. If None, shuffling will
-        be turned off.
-    eval_max_items : int, default = 100
+    fine_tune_eval_max_items : int, default = 100
         The maximum number of randomly-sampled time series to use from the validation set for evaluation
         during fine-tuning. If None, the entire validation dataset will be used.
-    trainer_kwargs : dict, optional
+    fine_tune_trainer_kwargs : dict, optional
         Extra keyword arguments passed to ``transformers.TrainingArguments``
     device : str, default = None
         Device to use for inference (and fine-tuning, if enabled). If None, model will use the GPU if available.
@@ -320,12 +320,12 @@ class ChronosModel(AbstractTimeSeriesModel):
         init_args.setdefault("fine_tune_steps", 5000)
         init_args.setdefault("fine_tune_batch_size", self.default_batch_size)
         init_args.setdefault("eval_during_fine_tune", False)
-        init_args.setdefault("eval_max_items", 100)
-        init_args.setdefault("shuffle_buffer_size", 10_000)
+        init_args.setdefault("fine_tune_eval_max_items", 100)
+        init_args.setdefault("fine_tune_shuffle_buffer_size", 10_000)
 
         eval_during_fine_tune = init_args["eval_during_fine_tune"]
         output_dir = Path(self.path) / "transformers_logs"
-        trainer_kwargs = dict(
+        fine_tune_trainer_kwargs = dict(
             output_dir=str(output_dir),
             per_device_train_batch_size=init_args["fine_tune_batch_size"],
             per_device_eval_batch_size=init_args["fine_tune_batch_size"],
@@ -351,10 +351,10 @@ class ChronosModel(AbstractTimeSeriesModel):
             load_best_model_at_end=True if eval_during_fine_tune else False,
             metric_for_best_model="eval_loss" if eval_during_fine_tune else None,
         )
-        user_trainer_kwargs = init_args.get("trainer_kwargs", {})
-        trainer_kwargs.update(user_trainer_kwargs)
+        user_fine_tune_trainer_kwargs = init_args.get("fine_tune_trainer_kwargs", {})
+        fine_tune_trainer_kwargs.update(user_fine_tune_trainer_kwargs)
 
-        init_args["trainer_kwargs"] = trainer_kwargs
+        init_args["fine_tune_trainer_kwargs"] = fine_tune_trainer_kwargs
 
         return init_args
 
@@ -395,11 +395,11 @@ class ChronosModel(AbstractTimeSeriesModel):
             # load model pipeline to device memory
             self.load_model_pipeline(is_training=True)
 
-            extra_trainer_kwargs = {}
+            extra_fine_tune_trainer_kwargs = {}
             fine_tune_prediction_length = self.prediction_length
             if isinstance(self.model_pipeline, ChronosBoltPipeline):
                 # custom label_names is needed for validation to work with ChronosBolt models
-                extra_trainer_kwargs = dict(label_names=["target"])
+                extra_fine_tune_trainer_kwargs = dict(label_names=["target"])
 
                 # truncate prediction_length if it goes beyond ChronosBolt's prediction_length
                 fine_tune_prediction_length = min(
@@ -412,18 +412,18 @@ class ChronosModel(AbstractTimeSeriesModel):
                         f"Setting prediction_length to {fine_tune_prediction_length}."
                     )
 
-            trainer_kwargs = fine_tune_args["trainer_kwargs"]
-            trainer_kwargs["disable_tqdm"] = trainer_kwargs.get("disable_tqdm", (verbosity < 3))
-            output_dir = Path(trainer_kwargs["output_dir"])
+            fine_tune_trainer_kwargs = fine_tune_args["fine_tune_trainer_kwargs"]
+            fine_tune_trainer_kwargs["disable_tqdm"] = fine_tune_trainer_kwargs.get("disable_tqdm", (verbosity < 3))
+            output_dir = Path(fine_tune_trainer_kwargs["output_dir"])
 
             if not eval_during_fine_tune:
                 # turn of eval-related trainer args
-                trainer_kwargs["evaluation_strategy"] = "no"
-                trainer_kwargs["eval_steps"] = None
-                trainer_kwargs["load_best_model_at_end"] = False
-                trainer_kwargs["metric_for_best_model"] = None
+                fine_tune_trainer_kwargs["evaluation_strategy"] = "no"
+                fine_tune_trainer_kwargs["eval_steps"] = None
+                fine_tune_trainer_kwargs["load_best_model_at_end"] = False
+                fine_tune_trainer_kwargs["metric_for_best_model"] = None
 
-            training_args = TrainingArguments(**trainer_kwargs, **extra_trainer_kwargs)
+            training_args = TrainingArguments(**fine_tune_trainer_kwargs, **extra_fine_tune_trainer_kwargs)
             tokenizer_train_dataset = ChronosFineTuningDataset(
                 target_df=train_data,
                 target_column=self.target,
@@ -433,7 +433,7 @@ class ChronosModel(AbstractTimeSeriesModel):
                 # the original Chronos models otherwise the data is returned in ChronosBolt's format
                 tokenizer=getattr(self.model_pipeline, "tokenizer", None),
                 mode="training",
-            ).shuffle(fine_tune_args["shuffle_buffer_size"])
+            ).shuffle(fine_tune_args["fine_tune_shuffle_buffer_size"])
 
             callbacks = []
             if time_limit is not None:
@@ -442,14 +442,14 @@ class ChronosModel(AbstractTimeSeriesModel):
             if val_data is not None:
                 callbacks.append(EvaluateAndSaveFinalStepCallback())
                 # evaluate on a randomly-sampled subset
-                eval_max_items = (
-                    min(val_data.num_items, fine_tune_args["eval_max_items"])
-                    if fine_tune_args["eval_max_items"] is not None
+                fine_tune_eval_max_items = (
+                    min(val_data.num_items, fine_tune_args["fine_tune_eval_max_items"])
+                    if fine_tune_args["fine_tune_eval_max_items"] is not None
                     else val_data.num_items
                 )
 
-                if eval_max_items < val_data.num_items:
-                    eval_items = np.random.choice(val_data.item_ids.values, size=eval_max_items, replace=False)
+                if fine_tune_eval_max_items < val_data.num_items:
+                    eval_items = np.random.choice(val_data.item_ids.values, size=fine_tune_eval_max_items, replace=False)
                     val_data = val_data.loc[eval_items]
 
                 tokenizer_val_dataset = ChronosFineTuningDataset(
