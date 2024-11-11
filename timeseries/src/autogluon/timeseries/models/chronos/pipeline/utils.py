@@ -17,6 +17,7 @@ from autogluon.timeseries.dataset.ts_dataframe import TimeSeriesDataFrame
 from autogluon.timeseries.models.gluonts.abstract_gluonts import SimpleGluonTSDataset
 
 if TYPE_CHECKING:
+    # TODO: fix the underlying reason for this circular import, the pipeline should handle tokenization
     from autogluon.timeseries.models.chronos.pipeline.chronos import ChronosTokenizer
 
 
